@@ -2,6 +2,7 @@ var mongodb = require('./mongodb');
 var DB = require('sharedb').DB;
 var OpLinkValidator = require('./op-link-validator');
 var MiddlewareHandler = require('./src/middleware/middlewareHandler');
+var crypto = require('crypto');
 
 module.exports = ShareDbMongo;
 
@@ -79,6 +80,35 @@ function ShareDbMongo(mongo, options) {
 ShareDbMongo.prototype = Object.create(DB.prototype);
 
 ShareDbMongo.prototype.projectsSnapshots = true;
+
+function normalizeIndexKey(key) {
+  return JSON.stringify(Object.entries(key || {}));
+}
+
+function ensureIndexesByKey(collection, definitions) {
+  return collection.indexes()
+    .catch(function(err) {
+      if (err && (err.code === 26 || err.codeName === 'NamespaceNotFound')) {
+        return [];
+      }
+      throw err;
+    })
+    .then(function(existingIndexes) {
+      var existingByKey = {};
+      for (var i = 0; i < existingIndexes.length; i++) {
+        var index = existingIndexes[i];
+        existingByKey[normalizeIndexKey(index.key)] = true;
+      }
+
+      var promises = [];
+      for (var j = 0; j < definitions.length; j++) {
+        var definition = definitions[j];
+        if (existingByKey[normalizeIndexKey(definition.key)]) continue;
+        promises.push(collection.createIndex(definition.key, definition.options));
+      }
+      return Promise.all(promises);
+    });
+}
 
 ShareDbMongo.prototype.getCollection = function(collectionName, callback) {
   // Check the collection name
@@ -199,6 +229,179 @@ ShareDbMongo.prototype.close = function(callback) {
   });
 };
 
+ShareDbMongo.prototype.getGraphCollection = function(callback) {
+  this.getDbs(function(err, mongo) {
+    if (err) return callback(err);
+    callback(null, mongo.collection('_graph_edges'));
+  });
+};
+
+ShareDbMongo.prototype.getNeighbors = function(cid, graphName, vertex, edgeData, options, callback) {
+  if (!checkGraphCid(cid, vertex)) {
+    return callback('Cannot get graph: ' + graphName + '/' + vertex, []);
+  }
+
+  this.getGraphCollection(function(err, collection) {
+    if (err) return callback(err);
+
+    var direction = options && options.direction;
+    var query = {
+      graph: graphName,
+      $or: []
+    };
+
+    if (!direction || direction === 'outbound' || direction === 'any') {
+      query.$or.push({from: vertex});
+    }
+    if (!direction || direction === 'inbound' || direction === 'any') {
+      query.$or.push({to: vertex});
+    }
+    if (!query.$or.length) {
+      query.$or.push({from: vertex});
+    }
+    addDataFilter(query, edgeData);
+
+    collection.find(query).toArray()
+      .then(function(edges) {
+        var results = edges.map(function(edge) {
+          var neighborVertex = edge.from === vertex ? edge.to : edge.from;
+          return {
+            d: idFromVertex(neighborVertex),
+            v: 1,
+            data: sanitizeGraphEdge(edge)
+          };
+        });
+
+        if (options && options.self) {
+          var selfId = idFromVertex(vertex);
+          if (selfId) {
+            results.push({d: selfId, v: 1, data: {}});
+          }
+        }
+
+        callback(null, results);
+      }, callback);
+  });
+};
+
+ShareDbMongo.prototype.getEdge = function(cid, graphName, from, to, edgeData, options, callback) {
+  if (!checkGraphCid(cid, from, to)) {
+    return callback('Cannot get graph: ' + graphName + '/' + from + '/' + to, []);
+  }
+
+  this.getGraphCollection(function(err, collection) {
+    if (err) return callback(err);
+
+    var direction = options && options.direction;
+    var query = {
+      graph: graphName,
+      $or: []
+    };
+
+    if (!direction || direction === 'outbound' || direction === 'any') {
+      query.$or.push({from: from, to: to});
+    }
+    if (direction === 'inbound' || direction === 'any') {
+      query.$or.push({from: to, to: from});
+    }
+    if (!query.$or.length) {
+      query.$or.push({from: from, to: to});
+    }
+    addDataFilter(query, edgeData);
+
+    collection.find(query).toArray()
+      .then(function(edges) {
+        callback(null, edges.map(function(edge) {
+          return {
+            d: idFromVertex(edge.to),
+            v: 1,
+            data: sanitizeGraphEdge(edge)
+          };
+        }));
+      }, callback);
+  });
+};
+
+ShareDbMongo.prototype.addEdge = function(graphName, from, to, data, callback) {
+  var graphDoc = createGraphDoc(graphName, from, to, data);
+
+  this.getGraphCollection(function(err, collection) {
+    if (err) return callback(err);
+
+    collection.findOne({
+      graph: graphName,
+      from: from,
+      to: to,
+      dataHash: graphDoc.dataHash
+    }).then(function(existing) {
+      if (existing) return null;
+      return collection.insertOne(graphDoc);
+    }).then(function() {
+      callback();
+    }, callback);
+  });
+};
+
+ShareDbMongo.prototype.removeEdge = function(graphName, from, to, data, callback) {
+  var query = {graph: graphName, from: from, to: to};
+  addDataFilter(query, data);
+
+  this.getGraphCollection(function(err, collection) {
+    if (err) return callback(err);
+
+    collection.deleteMany(query)
+      .then(function() {
+        callback();
+      }, callback);
+  });
+};
+
+ShareDbMongo.prototype.removeVertex = function(graphName, vertex, callback) {
+  this.getGraphCollection(function(err, collection) {
+    if (err) return callback(err);
+
+    collection.deleteMany({
+      graph: graphName,
+      $or: [{from: vertex}, {to: vertex}]
+    }).then(function() {
+      callback();
+    }, callback);
+  });
+};
+
+ShareDbMongo.prototype.setGraphData = function(graphName, from, to, data, callback) {
+  this.getGraphCollection(function(err, collection) {
+    if (err) return callback(err);
+
+    collection.updateMany(
+      {graph: graphName, from: from, to: to},
+      {$set: {data: shallowClone(data || {}), dataHash: hashGraphData(data), updatedAt: new Date()}}
+    ).then(function() {
+      callback();
+    }, callback);
+  });
+};
+
+ShareDbMongo.prototype.functionFetch = function(fn, params, callback) {
+  var self = this;
+  this.getDbs(function(err, mongo) {
+    if (err) return callback(err);
+    if (typeof fn !== 'function') {
+      return callback(new Error('Mongo adapter expects stored functions to be JavaScript functions'));
+    }
+
+    Promise.resolve(fn({
+      mongo: mongo,
+      getGraphCollection: function() {
+        return mongo.collection('_graph_edges');
+      }
+    }, params || {})).then(function(results) {
+      results = Array.isArray(results) ? results : [];
+      callback(null, results.map(castFunctionFetchResultToSnapshot));
+    }, callback);
+  });
+};
+
 
 // **** Commit methods
 
@@ -213,6 +416,20 @@ ShareDbMongo.prototype.commit = function(collectionName, id, op, snapshot, optio
       // Cleanup unsuccessful op if snapshot write failed. This is not
       // necessary for data correctness, but it gets rid of clutter
       self._deleteOp(request.collectionName, opId, function(removeErr) {
+        callback(err || removeErr, succeeded);
+      });
+    });
+  });
+};
+
+ShareDbMongo.prototype.commitDiff = function(collectionName, id, op, snapshot, options, callback) {
+  var self = this;
+  this._writeOp(collectionName, id, op, snapshot, function(err, result) {
+    if (err) return callback(err);
+    var opId = result.insertedId;
+    self._writeSnapshotDiff(collectionName, id, snapshot, opId, function(err, succeeded) {
+      if (succeeded) return callback(err, succeeded);
+      self._deleteOp(collectionName, opId, function(removeErr) {
         callback(err || removeErr, succeeded);
       });
     });
@@ -304,6 +521,33 @@ ShareDbMongo.prototype._writeSnapshot = function(request, id, snapshot, opId, ca
   });
 };
 
+ShareDbMongo.prototype._writeSnapshotDiff = function(collectionName, id, snapshot, opId, callback) {
+  this.getCollection(collectionName, function(err, collection) {
+    if (err) return callback(err);
+    var doc = castToDoc(id, snapshot, opId);
+
+    if (doc._v === 1) {
+      collection.insertOne(doc)
+        .then(function() {
+          callback(null, true);
+        }, function(err) {
+          if (err.code === 11000 && /\b_id_\b/.test(err.message)) {
+            return callback(null, false);
+          }
+          callback(err);
+        });
+      return;
+    }
+
+    var query = {_id: id, _v: doc._v - 1};
+    var update = buildSnapshotDiffUpdate(doc);
+    collection.updateOne(query, update)
+      .then(function(result) {
+        callback(null, !!result.modifiedCount);
+      }, callback);
+  });
+};
+
 
 // **** Snapshot methods
 
@@ -361,7 +605,7 @@ ShareDbMongo.prototype.getSnapshotBulk = function(collectionName, ids, fields, o
 
 // Overwrite me if you want to change this behaviour.
 ShareDbMongo.prototype.getOplogCollectionName = function(collectionName) {
-  return 'o_' + collectionName;
+  return 'ops_' + collectionName;
 };
 
 ShareDbMongo.prototype.validateCollectionName = function(collectionName) {
@@ -400,15 +644,24 @@ ShareDbMongo.prototype.getOpCollection = function(collectionName, callback) {
     // when there is a lot of data in the collection.
 
     var disabledIndexes = self.disableIndexCreation || {};
-    var promises = [
-      collection.createIndex({d: 1, v: 1}, {background: true}),
-      !disabledIndexes.src_seq_v && collection.createIndex({src: 1, seq: 1, v: 1}, {background: true})
+    var definitions = [
+      {key: {d: 1, v: 1}, options: {background: true}}
     ];
-    Promise.all(promises)
+    if (!disabledIndexes.src_seq_v) {
+      definitions.push({key: {src: 1, seq: 1, v: 1}, options: {background: true}});
+    }
+    ensureIndexesByKey(collection, definitions)
       .then(function() {
         self.opIndexes[collectionName] = true;
         callback(null, collection);
       }, callback);
+  });
+};
+
+ShareDbMongo.prototype.getOpCollections = function(collectionName, callback) {
+  this.getOpCollection(collectionName, function(err, collection) {
+    if (err) return callback(err);
+    callback(null, [collection]);
   });
 };
 
@@ -510,7 +763,7 @@ ShareDbMongo.prototype.getOpsBulk = function(collectionName, fromMap, toMap, opt
 
 ShareDbMongo.prototype.getCommittedOpVersion = function(collectionName, id, snapshot, op, options, callback) {
   var self = this;
-  this.getOpCollection(collectionName, function(err, opCollection) {
+  this.getOpCollections(collectionName, function(err, opCollections) {
     if (err) return callback(err);
     var query = {
       src: op.src,
@@ -522,8 +775,17 @@ ShareDbMongo.prototype.getCommittedOpVersion = function(collectionName, id, snap
     // Since ops are optimistically written prior to writing the snapshot, the
     // op could end up being written multiple times or have been written but
     // not count as committed if not backreferenced from the snapshot
-    opCollection.find(query).project(projection).sort(sort).limit(1).next()
-      .then(function(doc) {
+    Promise.all(opCollections.map(function(opCollection) {
+      return opCollection.find(query).project(projection).sort(sort).limit(1).next();
+    }))
+      .then(function(docs) {
+        var doc = null;
+        for (var i = 0; i < docs.length; i++) {
+          if (!docs[i]) continue;
+          if (!doc || docs[i].v < doc.v) {
+            doc = docs[i];
+          }
+        }
         // If we find no op with the same src and seq, we definitely don't have
         // any match. This should prevent us from accidentally querying a huge
         // history of ops
@@ -617,11 +879,18 @@ function getLatestDeleteOp(ops) {
   }
 }
 
+function idsEqual(a, b) {
+  if (a == null || b == null) return a === b;
+  if (a.equals) return a.equals(b);
+  if (b.equals) return b.equals(a);
+  return a === b;
+}
+
 function getLinkedOps(ops, to, link) {
   var linkedOps = [];
   for (var i = ops.length; i-- && link;) {
     var op = ops[i];
-    if (link.equals ? !link.equals(op._id) : link !== op._id) continue;
+    if (!idsEqual(link, op._id)) continue;
     link = op.o;
     if (to == null || op.v < to) {
       delete op._id;
@@ -646,8 +915,58 @@ function getOpsQuery(id, from, to) {
   return query;
 }
 
+function mergeOpsResults(results) {
+  var seen = {};
+  var merged = [];
+
+  for (var i = 0; i < results.length; i++) {
+    var ops = results[i] || [];
+    for (var j = 0; j < ops.length; j++) {
+      var op = ops[j];
+      var key = String(op && op._id);
+      if (seen[key]) continue;
+      seen[key] = true;
+      merged.push(op);
+    }
+  }
+
+  merged.sort(function(a, b) {
+    if (a.v !== b.v) return a.v - b.v;
+    var aId = String(a && a._id);
+    var bId = String(b && b._id);
+    if (aId < bId) return -1;
+    if (aId > bId) return 1;
+    return 0;
+  });
+
+  return merged;
+}
+
+function readOpsBulkFromResults(results, options) {
+  var projection = (options && options.metadata) ? null : {m: 0};
+  var opsMap = {};
+  var merged = mergeOpsResults(results);
+
+  for (var i = 0; i < merged.length; i++) {
+    var op = merged[i];
+    var normalized = shallowClone(op);
+    if (projection && projection.m === 0) {
+      delete normalized.m;
+    }
+    var id = normalized.d;
+    if (opsMap[id]) {
+      opsMap[id].push(normalized);
+    } else {
+      opsMap[id] = [normalized];
+    }
+    delete normalized.d;
+  }
+
+  return opsMap;
+}
+
 ShareDbMongo.prototype._getOps = function(collectionName, id, from, to, options, callback) {
-  this.getOpCollection(collectionName, function(err, opCollection) {
+  this.getOpCollections(collectionName, function(err, opCollections) {
     if (err) return callback(err);
     var query = getOpsQuery(id, from, to);
     // Exclude the `d` field, which is only for use internal to livedb-mongo.
@@ -655,22 +974,26 @@ ShareDbMongo.prototype._getOps = function(collectionName, id, from, to, options,
     // for tracking purposes
     var projection = (options && options.metadata) ? {d: 0} : {d: 0, m: 0};
     var sort = {v: 1};
-    opCollection.find(query).project(projection).sort(sort).toArray()
-      .then(function(result) {
-        callback(null, result);
+    Promise.all(opCollections.map(function(opCollection) {
+      return opCollection.find(query).project(projection).sort(sort).toArray();
+    }))
+      .then(function(results) {
+        callback(null, mergeOpsResults(results));
       }, callback);
   });
 };
 
 ShareDbMongo.prototype._getOpsBulk = function(collectionName, conditions, options, callback) {
-  this.getOpCollection(collectionName, function(err, opCollection) {
+  this.getOpCollections(collectionName, function(err, opCollections) {
     if (err) return callback(err);
     var query = {$or: conditions};
-    // Exclude the `m` field, which can be used to store metadata on ops for
-    // tracking purposes
     var projection = (options && options.metadata) ? null : {m: 0};
-    var stream = opCollection.find(query).project(projection).stream();
-    readOpsBulk(stream, callback);
+    Promise.all(opCollections.map(function(opCollection) {
+      return opCollection.find(query).project(projection).toArray();
+    }))
+      .then(function(results) {
+        callback(null, readOpsBulkFromResults(results, options));
+      }, callback);
   });
 };
 
@@ -968,7 +1291,6 @@ ShareDbMongo.prototype.canPollDoc = function(collectionName, query) {
 
   if (
     query.hasOwnProperty('$sort') ||
-    query.hasOwnProperty('$orderby') ||
     query.hasOwnProperty('$limit') ||
     query.hasOwnProperty('$skip') ||
     query.hasOwnProperty('$max') ||
@@ -1010,7 +1332,6 @@ ShareDbMongo.prototype.skipPoll = function(collectionName, id, op, query) {
 
 function getFields(query) {
   var fields = {};
-  getInnerFields(query.$orderby, fields);
   getInnerFields(query.$sort, fields);
   getInnerFields(query, fields);
   return fields;
@@ -1213,6 +1534,9 @@ function parseQuery(inputQuery) {
     }
   }
 
+  query = normalizeLegacyQuery(query);
+  cursorTransforms = normalizeLegacyCursorTransforms(cursorTransforms, query);
+
   return new ParsedQuery(
     query,
     collectionOperationKey,
@@ -1223,6 +1547,103 @@ function parseQuery(inputQuery) {
   );
 };
 ShareDbMongo._parseQuery = parseQuery; // for tests
+
+function normalizeLegacyCursorTransforms(cursorTransforms, query) {
+  if (!cursorTransforms) return cursorTransforms;
+
+  var normalized = {};
+  for (var key in cursorTransforms) {
+    var value = cursorTransforms[key];
+    if (key === '$sort') {
+      normalized[key] = normalizeLegacySort(value, query);
+      continue;
+    }
+    normalized[key] = value;
+  }
+  return normalized;
+}
+
+function normalizeLegacySort(sortSpec, query) {
+  if (!isPlainObject(sortSpec)) return sortSpec;
+
+  var normalizedSort = {};
+  for (var key in sortSpec) {
+    var value = sortSpec[key];
+
+    if (isValidMongoSortDirection(value)) {
+      normalizedSort[key] = value;
+      continue;
+    }
+
+    // Support malformed queries where a filter accidentally lives inside $sort.
+    query[key] = normalizeLegacyQueryValue(value);
+  }
+
+  return normalizedSort;
+}
+
+function isValidMongoSortDirection(value) {
+  if (value === 1 || value === -1) return true;
+  if (typeof value === 'string') {
+    return (
+      value === 'asc' ||
+      value === 'desc' ||
+      value === 'ascending' ||
+      value === 'descending'
+    );
+  }
+  return isPlainObject(value) && value.$meta != null;
+}
+
+function normalizeLegacyQuery(query) {
+  if (!isPlainObject(query)) return query;
+
+  var normalized = {};
+  for (var key in query) {
+    var value = query[key];
+    var normalizedKey = key;
+
+    if (key === '$or' || key === '$and' || key === '$nor') {
+      normalized[key] = Array.isArray(value) ?
+        value.map(normalizeLegacyQuery) :
+        normalizeLegacyQuery(value);
+      continue;
+    }
+
+    normalized[normalizedKey] = normalizeLegacyQueryValue(value);
+  }
+
+  return normalized;
+}
+
+function normalizeLegacyQueryValue(value) {
+  if (Array.isArray(value)) {
+    return value.map(normalizeLegacyQueryValue);
+  }
+  if (!isPlainObject(value)) return value;
+
+  var normalized = {};
+  for (var prop in value) {
+    var propValue = value[prop];
+    normalized[prop] = normalizeLegacyQueryValue(propValue);
+  }
+
+  return normalized;
+}
+
+function appendTopLevelClause(query, operator, clause) {
+  if (!query[operator]) {
+    query[operator] = [];
+  }
+
+  if (Array.isArray(clause)) {
+    for (var i = 0; i < clause.length; i++) {
+      query[operator].push(clause[i]);
+    }
+  } else {
+    query[operator].push(clause);
+  }
+}
 
 // Call on a query after it gets parsed to make it safe against
 // matching deleted documents.
@@ -1418,6 +1839,9 @@ function castToSnapshot(doc) {
   delete data._type;
   delete data._m;
   delete data._o;
+  if (data.id == null && id != null) {
+    data.id = id;
+  }
   return new MongoSnapshot(id, version, type, data, meta, opLink);
 }
 function MongoSnapshot(id, version, type, data, meta, opLink) {
@@ -1441,7 +1865,113 @@ function shallowClone(object) {
   return out;
 }
 
+function buildSnapshotDiffUpdate(doc) {
+  var $set = {};
+  var $unset = {};
+  flattenSnapshotDoc(doc, '', $set, $unset);
+  var update = {};
+  if (Object.keys($set).length) update.$set = $set;
+  if (Object.keys($unset).length) update.$unset = $unset;
+  return update;
+}
+
+function flattenSnapshotDoc(value, path, $set, $unset) {
+  if (value === undefined || value === null) {
+    if (path) $unset[path] = '';
+    return;
+  }
+
+  if (Array.isArray(value) || value instanceof Date || !isPlainObject(value)) {
+    if (path) $set[path] = value;
+    return;
+  }
+
+  var keys = Object.keys(value);
+  if (!keys.length) {
+    if (path) $set[path] = {};
+    return;
+  }
+
+  for (var i = 0; i < keys.length; i++) {
+    var key = keys[i];
+    var nextPath = path ? path + '.' + key : key;
+    flattenSnapshotDoc(value[key], nextPath, $set, $unset);
+  }
+}
+
+function checkGraphCid(cid, v1, v2) {
+  var match1 = v1 && v1.match(/^companies\/(.+)+$/);
+  var match2 = v2 && v2.match(/^companies\/(.+)+$/);
+
+  if (match1 && match1[1] !== cid) return false;
+  if (match2 && match2[1] !== cid) return false;
+  return true;
+}
+
+function idFromVertex(vertex) {
+  var match = vertex && vertex.match(/^([^/]+)\/([^/]+)$/);
+  return match && match[2];
+}
+
+function sanitizeGraphEdge(edge) {
+  var data = shallowClone(edge && edge.data || {});
+  data.from = edge.from;
+  data.to = edge.to;
+  return data;
+}
+
+function addDataFilter(query, data) {
+  if (!data) return;
+  for (var key in data) {
+    query['data.' + key] = data[key];
+  }
+}
+
+function createGraphDoc(graphName, from, to, data) {
+  return {
+    graph: graphName,
+    from: from,
+    to: to,
+    data: shallowClone(data || {}),
+    dataHash: hashGraphData(data),
+    createdAt: new Date(),
+    updatedAt: new Date()
+  };
+}
+
+function hashGraphData(data) {
+  return crypto.createHash('sha1').update(JSON.stringify(data || {})).digest('hex');
+}
+
+function castFunctionFetchResultToSnapshot(doc) {
+  if (!doc) return doc;
+  if (doc.id != null && doc.v != null && doc.type != null) return doc;
+
+  if (doc.hasOwnProperty('_data')) {
+    return new MongoSnapshot(
+      doc._key || new mongodb.ObjectId().toString(),
+      doc._v || 1,
+      doc._type || 'http://sharejs.org/types/JSONv0',
+      doc._data,
+      doc._m,
+      doc._o
+    );
+  }
+
+  var snapshotDoc = shallowClone(doc);
+  if (!snapshotDoc._id && snapshotDoc._key) {
+    snapshotDoc._id = snapshotDoc._key;
+  }
+  if (!snapshotDoc._id) {
+    snapshotDoc._id = new mongodb.ObjectId().toString();
+  }
+  if (!snapshotDoc._v) snapshotDoc._v = 1;
+  if (!snapshotDoc._type) snapshotDoc._type = 'http://sharejs.org/types/JSONv0';
+  return castToSnapshot(snapshotDoc);
+}
+
 function isPlainObject(value) {
+  if (value == null) return false;
   return (
     typeof value === 'object' && (
       Object.getPrototypeOf(value) === Object.prototype ||
@@ -1558,10 +2088,6 @@ var cursorTransformsMap = {
   $noCursorTimeout: function(cursor) {
     // no argument to cursor method
     return cursor.noCursorTimeout();
-  },
-  $orderby: function(cursor, value) {
-    console.warn('Deprecated: $orderby; Use $sort.');
-    return cursor.sort(value);
   },
   $readConcern: function(cursor, level) {
     return cursor.readConcern(level);
