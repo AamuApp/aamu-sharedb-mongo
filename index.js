@@ -207,6 +207,22 @@ function connect(mongo, options) {
   }
 }
 
+function idFromReturnVertex(vertex, neighborVertex, options) {
+  if (options && options.returnvertex === 'start') {
+    return idFromVertex(vertex);
+  }
+
+  return idFromVertex(neighborVertex);
+}
+
+function idFromEdgeEndpoints(from, to, options) {
+  if (options && options.returnvertex === 'start') {
+    return idFromVertex(from);
+  }
+
+  return idFromVertex(to);
+}
+
 ShareDbMongo.prototype.close = function(callback) {
   if (!callback) {
     callback = function(err) {
@@ -266,7 +282,7 @@ ShareDbMongo.prototype.getNeighbors = function(cid, graphName, vertex, edgeData,
         var results = edges.map(function(edge) {
           var neighborVertex = edge.from === vertex ? edge.to : edge.from;
           return {
-            d: idFromVertex(neighborVertex),
+            d: idFromReturnVertex(vertex, neighborVertex, options),
             v: 1,
             data: sanitizeGraphEdge(edge)
           };
@@ -313,7 +329,7 @@ ShareDbMongo.prototype.getEdge = function(cid, graphName, from, to, edgeData, op
       .then(function(edges) {
         callback(null, edges.map(function(edge) {
           return {
-            d: idFromVertex(edge.to),
+            d: idFromEdgeEndpoints(from, to, options),
             v: 1,
             data: sanitizeGraphEdge(edge)
           };
@@ -1922,6 +1938,8 @@ function flattenSnapshotDoc(value, path, $set, $unset) {
 }
 
 function checkGraphCid(cid, v1, v2) {
+  if (!cid) return true;
+
   var match1 = v1 && v1.match(/^companies\/(.+)+$/);
   var match2 = v2 && v2.match(/^companies\/(.+)+$/);
 
