@@ -1,6 +1,6 @@
 {
   "name": "aamu-sharedb-mongo",
-  "version": "5.1.0",
+  "version": "5.1.1",
   "description": "MongoDB database adapter for ShareDB",
   "main": "index.js",
   "dependencies": {
