@@ -373,12 +373,34 @@ ShareDbMongo.prototype.setGraphData = function(graphName, from, to, data, callba
   this.getGraphCollection(function(err, collection) {
     if (err) return callback(err);
 
-    collection.updateMany(
-      {graph: graphName, from: from, to: to},
-      {$set: {data: shallowClone(data || {}), dataHash: hashGraphData(data), updatedAt: new Date()}}
-    ).then(function() {
-      callback();
-    }, callback);
+    collection.find({graph: graphName, from: from, to: to}).toArray()
+      .then(function(edges) {
+        if (!edges.length) {
+          return collection.insertOne(createGraphDoc(graphName, from, to, data));
+        }
+
+        var updatedAt = new Date();
+        var operations = edges.map(function(edge) {
+          var mergedData = Object.assign({}, shallowClone(edge.data || {}), shallowClone(data || {}));
+          return {
+            updateOne: {
+              filter: {_id: edge._id},
+              update: {
+                $set: {
+                  data: mergedData,
+                  dataHash: hashGraphData(mergedData),
+                  updatedAt: updatedAt
+                }
+              }
+            }
+          };
+        });
+
+        return collection.bulkWrite(operations);
+      })
+      .then(function() {
+        callback();
+      }, callback);
   });
 };
 
