@@ -64,6 +64,116 @@ describe('mongo db', function() {
     });
   });
 
+  describe('commitDiff', function() {
+    it('replaces a null object parent with an object', function(done) {
+      var db = this.db;
+      var id = randomUUID();
+      var firstSnapshot = {
+        type: 'json0',
+        id: id,
+        v: 1,
+        data: {
+          data: {
+            state: 'open',
+            merged_by: null
+          }
+        }
+      };
+      var secondSnapshot = {
+        type: 'json0',
+        id: id,
+        v: 2,
+        data: {
+          data: {
+            state: 'closed',
+            merged_by: {
+              id: 702,
+              login: 'f92bcfc0cc6a-4dca-916f-8b82594e73b9'
+            }
+          }
+        }
+      };
+
+      db.commitDiff('testcollection', id, {v: 0, create: {}}, firstSnapshot, null, function(err) {
+        if (err) return done(err);
+        db.commitDiff('testcollection', id, {v: 1, op: []}, secondSnapshot, null, function(err) {
+          if (err) return done(err);
+          db.getSnapshot('testcollection', id, null, null, function(err, snapshot) {
+            if (err) return done(err);
+            expect(snapshot.data).eql(secondSnapshot.data);
+            done();
+          });
+        });
+      });
+    });
+
+    it('preserves existing object fields when setting nested leaves', function(done) {
+      var db = this.db;
+      var id = randomUUID();
+      var repoKey = '8cba7206-9668-4c41-b0af-fc104ba171a1';
+      var firstSnapshot = {
+        type: 'json0',
+        id: id,
+        v: 1,
+        data: {
+          git_repos: {}
+        }
+      };
+      firstSnapshot.data.git_repos[repoKey] = {
+        gitea: {
+          id: 123,
+          name: 'example',
+          size: 100,
+          owner: {
+            login: 'owner'
+          }
+        }
+      };
+
+      var secondSnapshot = {
+        type: 'json0',
+        id: id,
+        v: 2,
+        data: {
+          git_repos: {}
+        }
+      };
+      secondSnapshot.data.git_repos[repoKey] = {
+        gitea: {
+          size: 102,
+          updated_at: '2026-05-12T15:29:44+03:00'
+        }
+      };
+
+      var expectedData = {
+        git_repos: {}
+      };
+      expectedData.git_repos[repoKey] = {
+        gitea: {
+          id: 123,
+          name: 'example',
+          size: 102,
+          owner: {
+            login: 'owner'
+          },
+          updated_at: '2026-05-12T15:29:44+03:00'
+        }
+      };
+
+      db.commitDiff('testcollection', id, {v: 0, create: {}}, firstSnapshot, null, function(err) {
+        if (err) return done(err);
+        db.commitDiff('testcollection', id, {v: 1, op: []}, secondSnapshot, null, function(err) {
+          if (err) return done(err);
+          db.getSnapshot('testcollection', id, null, null, function(err, snapshot) {
+            if (err) return done(err);
+            expect(snapshot.data).eql(expectedData);
+            done();
+          });
+        });
+      });
+    });
+  });
+
   describe('security options', function() {
     it('does not allow editing the system collection', function(done) {
       var db = this.db;

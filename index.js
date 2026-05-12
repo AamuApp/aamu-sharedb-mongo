@@ -578,10 +578,14 @@ ShareDbMongo.prototype._writeSnapshotDiff = function(collectionName, id, snapsho
     }
 
     var query = {_id: id, _v: doc._v - 1};
-    var update = buildSnapshotDiffUpdate(doc);
-    collection.updateOne(query, update)
-      .then(function(result) {
-        callback(null, !!result.modifiedCount);
+    collection.findOne(query)
+      .then(function(previousDoc) {
+        if (!previousDoc) return callback(null, false);
+        var update = buildSnapshotDiffUpdate(doc, previousDoc);
+        collection.updateOne(query, update)
+          .then(function(result) {
+            callback(null, !!result.modifiedCount);
+          }, callback);
       }, callback);
   });
 };
@@ -1903,17 +1907,17 @@ function shallowClone(object) {
   return out;
 }
 
-function buildSnapshotDiffUpdate(doc) {
+function buildSnapshotDiffUpdate(doc, previousDoc) {
   var $set = {};
   var $unset = {};
-  flattenSnapshotDoc(doc, '', $set, $unset);
+  flattenSnapshotDoc(doc, '', $set, $unset, previousDoc);
   var update = {};
   if (Object.keys($set).length) update.$set = $set;
   if (Object.keys($unset).length) update.$unset = $unset;
   return update;
 }
 
-function flattenSnapshotDoc(value, path, $set, $unset) {
+function flattenSnapshotDoc(value, path, $set, $unset, previousValue) {
   if (value === undefined || value === null) {
     if (path) $unset[path] = '';
     return;
@@ -1930,10 +1934,16 @@ function flattenSnapshotDoc(value, path, $set, $unset) {
     return;
   }
 
+  if (path && previousValue !== undefined && !isPlainObject(previousValue)) {
+    $set[path] = value;
+    return;
+  }
+
   for (var i = 0; i < keys.length; i++) {
     var key = keys[i];
     var nextPath = path ? path + '.' + key : key;
-    flattenSnapshotDoc(value[key], nextPath, $set, $unset);
+    var nextPreviousValue = isPlainObject(previousValue) ? previousValue[key] : undefined;
+    flattenSnapshotDoc(value[key], nextPath, $set, $unset, nextPreviousValue);
   }
 }
 
