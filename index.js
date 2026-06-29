@@ -6,6 +6,45 @@ var crypto = require('crypto');
 
 module.exports = ShareDbMongo;
 
+function isPerfEnabled() {
+  return !!(process.env.AAMU_PERF_SHAREDB || process.env.AAMU_PERF_TASK_CREATE || process.env.AAMU_PERF);
+}
+
+function shouldLogPerf(collectionName, durationMs) {
+  if (!isPerfEnabled()) return false;
+  var minMs = Number(process.env.AAMU_PERF_SHAREDB_MIN_MS || 0);
+  if (durationMs != null && durationMs < minMs) return false;
+  var filter = process.env.AAMU_PERF_SHAREDB_COLLECTION;
+  if (!filter) return true;
+  return filter.split(',').map(function(value) { return value.trim(); }).indexOf(collectionName) !== -1;
+}
+
+function perfNow() {
+  if (typeof performance !== 'undefined' && performance.now) return performance.now();
+  return Date.now();
+}
+
+function perfSize(value) {
+  try {
+    return Buffer.byteLength(JSON.stringify(value || {}), 'utf8');
+  } catch (err) {
+    return undefined;
+  }
+}
+
+function perfLog(collectionName, step, durationMs, data) {
+  if (!shouldLogPerf(collectionName, durationMs)) return;
+  var payload = Object.assign({
+    ts: new Date().toISOString(),
+    operation: 'sharedb-mongo',
+    event: 'step',
+    step: step,
+    durationMs: Math.round(durationMs * 1000) / 1000,
+    collection: collectionName
+  }, data || {});
+  console.log('[aamu-perf]', JSON.stringify(payload));
+}
+
 function ShareDbMongo(mongo, options) {
   // use without new
   if (!(this instanceof ShareDbMongo)) {
@@ -445,11 +484,19 @@ ShareDbMongo.prototype.functionFetch = function(fn, params, callback) {
 
 ShareDbMongo.prototype.commit = function(collectionName, id, op, snapshot, options, callback) {
   var self = this;
+  var start = perfNow();
   var request = createRequestForMiddleware(options, collectionName, op);
   this._writeOp(collectionName, id, op, snapshot, function(err, result) {
     if (err) return callback(err);
     var opId = result.insertedId;
     self._writeSnapshot(request, id, snapshot, opId, function(err, succeeded) {
+      perfLog(collectionName, 'commit', perfNow() - start, {
+        id: id,
+        opVersion: op && op.v,
+        snapshotVersion: snapshot && snapshot.v,
+        succeeded: !!succeeded,
+        error: err ? String(err) : undefined
+      });
       if (succeeded) return callback(err, succeeded);
       // Cleanup unsuccessful op if snapshot write failed. This is not
       // necessary for data correctness, but it gets rid of clutter
@@ -462,10 +509,20 @@ ShareDbMongo.prototype.commit = function(collectionName, id, op, snapshot, optio
 
 ShareDbMongo.prototype.commitDiff = function(collectionName, id, op, snapshot, options, callback) {
   var self = this;
+  var start = perfNow();
   this._writeOp(collectionName, id, op, snapshot, function(err, result) {
     if (err) return callback(err);
     var opId = result.insertedId;
     self._writeSnapshotDiff(collectionName, id, snapshot, opId, function(err, succeeded) {
+      perfLog(collectionName, 'commitDiff', perfNow() - start, {
+        id: id,
+        opVersion: op && op.v,
+        snapshotVersion: snapshot && snapshot.v,
+        opSizeBytes: perfSize(op),
+        diffSizeBytes: perfSize(snapshot && snapshot.data),
+        succeeded: !!succeeded,
+        error: err ? String(err) : undefined
+      });
       if (succeeded) return callback(err, succeeded);
       self._deleteOp(collectionName, opId, function(removeErr) {
         callback(err || removeErr, succeeded);
@@ -496,13 +553,23 @@ ShareDbMongo.prototype._writeOp = function(collectionName, id, op, snapshot, cal
     var err = ShareDbMongo.invalidOpVersionError(collectionName, id, op.v);
     return callback(err);
   }
+  var start = perfNow();
   this.getOpCollection(collectionName, function(err, opCollection) {
     if (err) return callback(err);
+    var gotCollectionAt = perfNow();
     var doc = shallowClone(op);
     doc.d = id;
     doc.o = snapshot._opLink;
     opCollection.insertOne(doc)
       .then(function(result) {
+        var end = perfNow();
+        perfLog(collectionName, 'writeOp', end - start, {
+          id: id,
+          opVersion: op && op.v,
+          getCollectionMs: Math.round((gotCollectionAt - start) * 1000) / 1000,
+          insertOneMs: Math.round((end - gotCollectionAt) * 1000) / 1000,
+          opSizeBytes: perfSize(doc)
+        });
         callback(null, result);
       }, callback);
   });
@@ -520,8 +587,10 @@ ShareDbMongo.prototype._deleteOp = function(collectionName, opId, callback) {
 
 ShareDbMongo.prototype._writeSnapshot = function(request, id, snapshot, opId, callback) {
   var self = this;
+  var start = perfNow();
   this.getCollection(request.collectionName, function(err, collection) {
     if (err) return callback(err);
+    var gotCollectionAt = perfNow();
     request.documentToWrite = castToDoc(id, snapshot, opId);
     if (request.documentToWrite._v === 1) {
       self._middleware.trigger(MiddlewareHandler.Actions.beforeCreate, request, function(middlewareErr) {
@@ -531,6 +600,12 @@ ShareDbMongo.prototype._writeSnapshot = function(request, id, snapshot, opId, ca
         collection.insertOne(request.documentToWrite)
           .then(
             function() {
+              perfLog(request.collectionName, 'writeSnapshot.insert', perfNow() - start, {
+                id: id,
+                version: request.documentToWrite._v,
+                getCollectionMs: Math.round((gotCollectionAt - start) * 1000) / 1000,
+                docSizeBytes: perfSize(request.documentToWrite)
+              });
               callback(null, true);
             },
             function(err) {
@@ -552,6 +627,13 @@ ShareDbMongo.prototype._writeSnapshot = function(request, id, snapshot, opId, ca
         collection.replaceOne(request.query, request.documentToWrite)
           .then(function(result) {
             var succeeded = !!result.modifiedCount;
+            perfLog(request.collectionName, 'writeSnapshot.replace', perfNow() - start, {
+              id: id,
+              version: request.documentToWrite._v,
+              getCollectionMs: Math.round((gotCollectionAt - start) * 1000) / 1000,
+              docSizeBytes: perfSize(request.documentToWrite),
+              succeeded: succeeded
+            });
             callback(null, succeeded);
           }, callback);
       });
@@ -560,13 +642,21 @@ ShareDbMongo.prototype._writeSnapshot = function(request, id, snapshot, opId, ca
 };
 
 ShareDbMongo.prototype._writeSnapshotDiff = function(collectionName, id, snapshot, opId, callback) {
+  var start = perfNow();
   this.getCollection(collectionName, function(err, collection) {
     if (err) return callback(err);
+    var gotCollectionAt = perfNow();
     var doc = castToDoc(id, snapshot, opId);
 
     if (doc._v === 1) {
       collection.insertOne(doc)
         .then(function() {
+          perfLog(collectionName, 'writeSnapshotDiff.insert', perfNow() - start, {
+            id: id,
+            version: doc._v,
+            getCollectionMs: Math.round((gotCollectionAt - start) * 1000) / 1000,
+            diffSizeBytes: perfSize(doc)
+          });
           callback(null, true);
         }, function(err) {
           if (err.code === 11000 && /\b_id_\b/.test(err.message)) {
@@ -580,10 +670,22 @@ ShareDbMongo.prototype._writeSnapshotDiff = function(collectionName, id, snapsho
     var query = {_id: id, _v: doc._v - 1};
     collection.findOne(query)
       .then(function(previousDoc) {
+        var foundAt = perfNow();
         if (!previousDoc) return callback(null, false);
         var update = buildSnapshotDiffUpdate(doc, previousDoc);
         collection.updateOne(query, update)
           .then(function(result) {
+            var end = perfNow();
+            perfLog(collectionName, 'writeSnapshotDiff.update', end - start, {
+              id: id,
+              version: doc._v,
+              getCollectionMs: Math.round((gotCollectionAt - start) * 1000) / 1000,
+              findOneMs: Math.round((foundAt - gotCollectionAt) * 1000) / 1000,
+              updateOneMs: Math.round((end - foundAt) * 1000) / 1000,
+              diffSizeBytes: perfSize(doc),
+              updateSizeBytes: perfSize(update),
+              succeeded: !!result.modifiedCount
+            });
             callback(null, !!result.modifiedCount);
           }, callback);
       }, callback);
@@ -595,8 +697,10 @@ ShareDbMongo.prototype._writeSnapshotDiff = function(collectionName, id, snapsho
 
 ShareDbMongo.prototype.getSnapshot = function(collectionName, id, fields, options, callback) {
   var self = this;
+  var start = perfNow();
   this.getCollection(collectionName, function(err, collection) {
     if (err) return callback(err);
+    var gotCollectionAt = perfNow();
     var query = {_id: id};
     var projection = getProjection(fields, options);
     var request = createRequestForMiddleware(options, collectionName, null, fields);
@@ -607,6 +711,15 @@ ShareDbMongo.prototype.getSnapshot = function(collectionName, id, fields, option
       collection.find(request.query, request.findOptions).limit(1).project(projection).next()
         .then(function(doc) {
           var snapshot = (doc) ? castToSnapshot(doc) : new MongoSnapshot(id, 0, null, undefined);
+          if (fields && fields.$submit === true) {
+            perfLog(collectionName, 'getSnapshot.submit', perfNow() - start, {
+              id: id,
+              getCollectionMs: Math.round((gotCollectionAt - start) * 1000) / 1000,
+              found: !!doc,
+              snapshotVersion: snapshot && snapshot.v,
+              docSizeBytes: perfSize(doc)
+            });
+          }
           callback(null, snapshot);
         }, callback);
     });
