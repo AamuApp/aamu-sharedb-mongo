@@ -6,12 +6,10 @@ var crypto = require('crypto');
 
 module.exports = ShareDbMongo;
 
-function isPerfEnabled() {
-  return !!(process.env.AAMU_PERF_SHAREDB || process.env.AAMU_PERF_TASK_CREATE || process.env.AAMU_PERF);
-}
+var PERF_ENABLED = !!(process.env.AAMU_PERF_SHAREDB || process.env.AAMU_PERF_TASK_CREATE || process.env.AAMU_PERF);
 
 function shouldLogPerf(collectionName, durationMs) {
-  if (!isPerfEnabled()) return false;
+  if (!PERF_ENABLED) return false;
   var minMs = Number(process.env.AAMU_PERF_SHAREDB_MIN_MS || 0);
   if (durationMs != null && durationMs < minMs) return false;
   var filter = process.env.AAMU_PERF_SHAREDB_COLLECTION;
@@ -20,11 +18,13 @@ function shouldLogPerf(collectionName, durationMs) {
 }
 
 function perfNow() {
+  if (!PERF_ENABLED) return 0;
   if (typeof performance !== 'undefined' && performance.now) return performance.now();
   return Date.now();
 }
 
 function perfSize(value) {
+  if (!PERF_ENABLED) return undefined;
   try {
     return Buffer.byteLength(JSON.stringify(value || {}), 'utf8');
   } catch (err) {
