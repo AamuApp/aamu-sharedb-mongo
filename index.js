@@ -7,9 +7,12 @@ var crypto = require('crypto');
 module.exports = ShareDbMongo;
 
 var PERF_ENABLED = !!(process.env.AAMU_PERF_SHAREDB || process.env.AAMU_PERF_TASK_CREATE || process.env.AAMU_PERF);
+var MONGO_DRIVER_PERF_ENABLED = process.env.AAMU_MONGO_DRIVER_PERF === '1';
 
 function shouldLogPerf(collectionName, durationMs) {
   if (!PERF_ENABLED) return false;
+  var scopeFilter = process.env.AAMU_PERF_SHAREDB_SCOPE;
+  if (scopeFilter && scopeFilter.split(',').map(function(value) { return value.trim(); }).indexOf('mongo') === -1) return false;
   var minMs = Number(process.env.AAMU_PERF_SHAREDB_MIN_MS || 0);
   if (durationMs != null && durationMs < minMs) return false;
   var filter = process.env.AAMU_PERF_SHAREDB_COLLECTION;
@@ -18,7 +21,7 @@ function shouldLogPerf(collectionName, durationMs) {
 }
 
 function perfNow() {
-  if (!PERF_ENABLED) return 0;
+  if (!PERF_ENABLED && !MONGO_DRIVER_PERF_ENABLED) return 0;
   if (typeof performance !== 'undefined' && performance.now) return performance.now();
   return Date.now();
 }
@@ -44,6 +47,196 @@ function perfLog(collectionName, step, durationMs, data) {
   }, data || {});
   console.log('[aamu-perf]', JSON.stringify(payload));
 }
+
+function statKey(commandName, namespace) {
+  return commandName + ' ' + (namespace || '');
+}
+
+function percentile(values, p) {
+  if (!values.length) return 0;
+  var sorted = values.slice().sort(function(a, b) { return a - b; });
+  var index = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1);
+  return sorted[index];
+}
+
+function roundedMs(value) {
+  return Math.round(value * 1000) / 1000;
+}
+
+function createMongoDriverPerf() {
+  var pending = new Map();
+  var checkoutStartedByAddress = new Map();
+  var stats = new Map();
+  var checkoutStats = new Map();
+  var intervalMs = Number(process.env.AAMU_MONGO_DRIVER_PERF_INTERVAL_MS || 5000);
+  var minMs = Number(process.env.AAMU_MONGO_DRIVER_PERF_MIN_MS || 0);
+
+  function getStats(commandName, namespace) {
+    var key = statKey(commandName, namespace);
+    var item = stats.get(key);
+    if (!item) {
+      item = {
+        commandName: commandName,
+        namespace: namespace,
+        count: 0,
+        errors: 0,
+        totalMs: 0,
+        maxMs: 0,
+        samples: []
+      };
+      stats.set(key, item);
+    }
+    return item;
+  }
+
+  function getCheckoutStats(address) {
+    address = address || 'unknown';
+    var item = checkoutStats.get(address);
+    if (!item) {
+      item = {
+        address: address,
+        count: 0,
+        failures: 0,
+        totalMs: 0,
+        maxMs: 0,
+        samples: []
+      };
+      checkoutStats.set(address, item);
+    }
+    return item;
+  }
+
+  function namespaceFromEvent(event) {
+    if (event.databaseName && event.commandName && event.command) {
+      var collection = event.command[event.commandName];
+      if (typeof collection === 'string') return event.databaseName + '.' + collection;
+    }
+    return event.databaseName || '';
+  }
+
+  function finish(event, failed) {
+    var started = pending.get(event.requestId);
+    if (!started) return;
+    pending.delete(event.requestId);
+
+    var durationMs = perfNow() - started.start;
+    if (durationMs < minMs) return;
+
+    var item = getStats(started.commandName, started.namespace);
+    item.count++;
+    if (failed) item.errors++;
+    item.totalMs += durationMs;
+    if (durationMs > item.maxMs) item.maxMs = durationMs;
+    item.samples.push(durationMs);
+  }
+
+  function checkoutAddress(event) {
+    return event && (event.address || event.serverAddress || event.connectionId && event.connectionId.address) || 'unknown';
+  }
+
+  function checkoutStarted(event) {
+    var address = checkoutAddress(event);
+    var queue = checkoutStartedByAddress.get(address);
+    if (!queue) {
+      queue = [];
+      checkoutStartedByAddress.set(address, queue);
+    }
+    queue.push(perfNow());
+  }
+
+  function checkoutFinished(event, failed) {
+    var address = checkoutAddress(event);
+    var queue = checkoutStartedByAddress.get(address);
+    var start = queue && queue.length ? queue.shift() : 0;
+    var durationMs = typeof event.durationMS === 'number' ? event.durationMS : start ? perfNow() - start : 0;
+    if (durationMs < minMs) return;
+
+    var item = getCheckoutStats(address);
+    item.count++;
+    if (failed) item.failures++;
+    item.totalMs += durationMs;
+    if (durationMs > item.maxMs) item.maxMs = durationMs;
+    item.samples.push(durationMs);
+  }
+
+  function flush() {
+    if (!stats.size && !checkoutStats.size) return;
+    var top = Array.from(stats.values())
+      .sort(function(a, b) { return b.totalMs - a.totalMs; })
+      .slice(0, Number(process.env.AAMU_MONGO_DRIVER_PERF_TOP_N || 20))
+      .map(function(item) {
+        return {
+          commandName: item.commandName,
+          namespace: item.namespace,
+          count: item.count,
+          errors: item.errors,
+          avgMs: roundedMs(item.totalMs / item.count),
+          p50Ms: roundedMs(percentile(item.samples, 50)),
+          p95Ms: roundedMs(percentile(item.samples, 95)),
+          p99Ms: roundedMs(percentile(item.samples, 99)),
+          maxMs: roundedMs(item.maxMs),
+          totalMs: roundedMs(item.totalMs)
+        };
+      });
+    var pool = Array.from(checkoutStats.values())
+      .sort(function(a, b) { return b.totalMs - a.totalMs; })
+      .slice(0, Number(process.env.AAMU_MONGO_DRIVER_PERF_TOP_N || 20))
+      .map(function(item) {
+        return {
+          address: item.address,
+          count: item.count,
+          failures: item.failures,
+          avgMs: roundedMs(item.totalMs / item.count),
+          p50Ms: roundedMs(percentile(item.samples, 50)),
+          p95Ms: roundedMs(percentile(item.samples, 95)),
+          p99Ms: roundedMs(percentile(item.samples, 99)),
+          maxMs: roundedMs(item.maxMs),
+          totalMs: roundedMs(item.totalMs)
+        };
+      });
+
+    console.log('[aamu-perf]', JSON.stringify({
+      ts: new Date().toISOString(),
+      operation: 'mongo-driver',
+      event: 'summary',
+      intervalMs: intervalMs,
+      top: top,
+      pool: pool
+    }));
+    stats.clear();
+    checkoutStats.clear();
+  }
+
+  setInterval(flush, intervalMs).unref();
+
+  return {
+    install: function(client) {
+      if (!client || typeof client.on !== 'function') return;
+      client.on('commandStarted', function(event) {
+        pending.set(event.requestId, {
+          start: perfNow(),
+          commandName: event.commandName,
+          namespace: namespaceFromEvent(event)
+        });
+      });
+      client.on('commandSucceeded', function(event) {
+        finish(event, false);
+      });
+      client.on('commandFailed', function(event) {
+        finish(event, true);
+      });
+      client.on('connectionCheckOutStarted', checkoutStarted);
+      client.on('connectionCheckedOut', function(event) {
+        checkoutFinished(event, false);
+      });
+      client.on('connectionCheckOutFailed', function(event) {
+        checkoutFinished(event, true);
+      });
+    }
+  };
+}
+
+var mongoDriverPerf = MONGO_DRIVER_PERF_ENABLED ? createMongoDriverPerf() : null;
 
 function ShareDbMongo(mongo, options) {
   // use without new
@@ -238,11 +431,21 @@ function connect(mongo, options) {
   delete options.allowAggregateQueries;
   delete options.getOpsWithoutStrictLinking;
 
+  if (MONGO_DRIVER_PERF_ENABLED) {
+    options.monitorCommands = true;
+  }
+
   if (typeof mongodb.connect === 'function') {
-    return mongodb.connect(mongo, options);
+    return mongodb.connect(mongo, options).then(function(client) {
+      if (mongoDriverPerf) mongoDriverPerf.install(client);
+      return client;
+    });
   } else {
     var client = new mongodb.MongoClient(mongo, options);
-    return client.connect();
+    return client.connect().then(function(connectedClient) {
+      if (mongoDriverPerf) mongoDriverPerf.install(connectedClient || client);
+      return connectedClient || client;
+    });
   }
 }
 
@@ -597,13 +800,16 @@ ShareDbMongo.prototype._writeSnapshot = function(request, id, snapshot, opId, ca
         if (middlewareErr) {
           return callback(middlewareErr);
         }
+        var insertStarted = perfNow();
         collection.insertOne(request.documentToWrite)
           .then(
             function() {
+              var end = perfNow();
               perfLog(request.collectionName, 'writeSnapshot.insert', perfNow() - start, {
                 id: id,
                 version: request.documentToWrite._v,
                 getCollectionMs: Math.round((gotCollectionAt - start) * 1000) / 1000,
+                insertOneMs: Math.round((end - insertStarted) * 1000) / 1000,
                 docSizeBytes: perfSize(request.documentToWrite)
               });
               callback(null, true);
