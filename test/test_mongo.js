@@ -64,6 +64,28 @@ describe('mongo db', function() {
     });
   });
 
+  describe('query', function() {
+    it('uses version 1 for legacy documents missing _v', function(done) {
+      var db = this.db;
+      var id = randomUUID();
+      this.mongo.collection('testcollection').insertOne({
+        _id: id,
+        _type: 'http://sharejs.org/types/JSONv0',
+        cid: 'c1',
+        name: 'legacy'
+      }).then(function() {
+        db.query('testcollection', {cid: 'c1'}, null, null, function(err, snapshots) {
+          if (err) return done(err);
+          expect(snapshots).to.have.length(1);
+          expect(snapshots[0].id).equal(id);
+          expect(snapshots[0].v).equal(1);
+          expect(snapshots[0].data.name).equal('legacy');
+          done();
+        });
+      }, done);
+    });
+  });
+
   describe('commitDiff', function() {
     it('replaces a null object parent with an object', function(done) {
       var db = this.db;

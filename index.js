@@ -2183,7 +2183,7 @@ function castToDoc(id, snapshot, opLink) {
 
 function castToSnapshot(doc) {
   var id = doc._id;
-  var version = doc._v;
+  var version = doc._v == null ? 1 : doc._v;
   var type = doc._type;
   var data = doc._data;
   var meta = doc._m;
