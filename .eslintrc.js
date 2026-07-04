@@ -38,6 +38,7 @@ const SHAREDB_RULES = {
 
 module.exports = {
   extends: 'google',
+  plugins: ['@typescript-eslint'],
   parserOptions: {
     ecmaVersion: 3
   },
