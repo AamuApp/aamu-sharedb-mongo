@@ -38,9 +38,10 @@ describe('mongo db', function() {
   describe('indexes', function() {
     it('adds ops index', function(done) {
       var mongo = this.mongo;
-      this.db.commit('testcollection', 'foo', {v: 0, create: {}}, {}, null, function(err) {
+      var db = this.db;
+      db.commit('testcollection', 'foo', {v: 0, create: {}}, {}, null, function(err) {
         if (err) return done(err);
-        mongo.collection('o_testcollection').indexInformation().then(function(indexes) {
+        mongo.collection(db.getOplogCollectionName('testcollection')).indexInformation().then(function(indexes) {
           // Index for getting document(s) ops
           expect(indexes['d_1_v_1']).ok;
           // Index for checking committed op(s) by src and seq
@@ -581,7 +582,7 @@ describe('options', function() {
         db.getDbs(next);
       },
       function(mongo, mongoPoll, next) {
-        mongo.collection('o_' + collection).indexInformation().then(function(indexes) {
+        mongo.collection(db.getOplogCollectionName(collection)).indexInformation().then(function(indexes) {
           expect(indexes['d_1_v_1']).not.to.be.ok;
           expect(indexes['src_1_seq_1_v_1']).not.to.be.ok;
           next();
@@ -599,7 +600,7 @@ describe('options', function() {
         db.getDbs(next);
       },
       function(mongo, mongoPoll, next) {
-        mongo.collection('o_' + collection).indexInformation().then(function(indexes) {
+        mongo.collection(db.getOplogCollectionName(collection)).indexInformation().then(function(indexes) {
           expect(indexes['d_1_v_1']).to.be.ok;
           expect(indexes['src_1_seq_1_v_1']).not.to.be.ok;
           next();

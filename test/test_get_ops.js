@@ -62,10 +62,8 @@ function create(options, callback) {
         ];
 
         commitOpChain(db, mongo, collection, id, ops, function(error) {
-          if (error) done(error);
-          mongo.collection('o_' + collection).deleteOne({v: 1}).then(function() {
-            done();
-          });
+          if (error) return done(error);
+          deleteCommittedOp(db, collection, id, 1, done);
         });
       });
 
@@ -130,8 +128,44 @@ function commitOpChain(db, mongo, collection, id, ops, previousOpId, version, ca
   var snapshot = {id: id, v: version + 1, type: 'json0', data: {}, m: null, _opLink: previousOpId};
   db.commit(collection, id, op, snapshot, null, function(error) {
     if (error) return callback(error);
-    mongo.collection('o_' + collection).find({d: id, v: version}).next().then(function(op) {
+    getCommittedOp(db, collection, id, version, function(error, op) {
+      if (error) return callback(error);
       commitOpChain(db, mongo, collection, id, ops, (op ? op._id : null), ++version, callback);
     });
+  });
+}
+
+function deleteCommittedOp(db, collection, id, version, callback) {
+  db.getOpCollections(collection, function(error, opCollections) {
+    if (error) return callback(error);
+
+    Promise.all(opCollections.map(function(opCollection) {
+      return opCollection.deleteOne({d: id, v: version});
+    })).then(function() {
+      callback();
+    }, callback);
+  });
+}
+
+function getCommittedOp(db, collection, id, version, callback) {
+  db.getOpCollections(collection, function(error, opCollections) {
+    if (error) return callback(error);
+
+    var pending = opCollections.length;
+    for (var i = 0; i < opCollections.length; i++) {
+      opCollections[i].find({d: id, v: version}).next().then(function(op) {
+        if (!pending) return;
+        if (op) {
+          pending = 0;
+          return callback(null, op);
+        }
+        pending--;
+        if (!pending) callback(null, null);
+      }, function(error) {
+        if (!pending) return;
+        pending = 0;
+        callback(error);
+      });
+    }
   });
 }

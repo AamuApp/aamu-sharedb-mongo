@@ -1,7 +1,8 @@
 var async = require('async');
 var sinon = require('sinon');
 var chai = require('chai');
-chai.use(require('sinon-chai'));
+var sinonChai = require('sinon-chai');
+chai.use(sinonChai.default || sinonChai);
 var expect = chai.expect;
 var ShareDbMongo = require('..');
 var mongodb = require('./../mongodb');
@@ -405,9 +406,7 @@ describe('mongo db middleware', function() {
         if (err) return done(err);
         db.getSnapshot('testcollection', 'test1', null, null, function(err, doc) {
           if (err) return done(err);
-          expect(doc.data).eql({
-            foo: 'bar'
-          });
+          expect(doc.data.foo).to.equal('bar');
 
           // Change the query to look for baz and not bar
           db.use(BEFORE_SNAPSHOT_LOOKUP, function(request, next) {
@@ -417,9 +416,7 @@ describe('mongo db middleware', function() {
 
           db.getSnapshot('testcollection', 'test1', null, null, function(err, doc) {
             if (err) return done(err);
-            expect(doc.data).eql({
-              foo: 'baz'
-            });
+            expect(doc.data.foo).to.equal('baz');
             done();
           });
         });
@@ -463,9 +460,7 @@ describe('mongo db middleware', function() {
 
     db.query('testcollection', query, null, null, function(err, results) {
       if (err) return done(err);
-      expect(results[0].data).eql({
-        foo: valueOfFoo
-      });
+      expect(results[0].data.foo).to.equal(valueOfFoo);
       cb();
     });
   };

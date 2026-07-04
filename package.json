@@ -5,24 +5,26 @@
   "main": "index.js",
   "dependencies": {
     "mongodb": "*",
-    "sharedb": "^1.9.1 || ^2.0.0 || ^3.0.0 || ^4.0.0 || ^5.0.0"
+    "sharedb": "^6.0.0"
   },
   "devDependencies": {
-    "async": "^3.2.4",
-    "chai": "^4.2.0",
-    "coveralls": "^3.0.7",
-    "eslint": "^5.16.0",
-    "eslint-config-google": "^0.13.0",
-    "mocha": "^6.2.2",
-    "nyc": "^14.1.1",
-    "ot-json1": "^1.0.1",
+    "@typescript-eslint/eslint-plugin": "^8.62.1",
+    "@typescript-eslint/parser": "^8.62.1",
+    "async": "^3.2.6",
+    "chai": "^6.2.2",
+    "coveralls": "^3.1.1",
+    "eslint": "^10.6.0",
+    "eslint-config-google": "^0.14.0",
+    "mocha": "^11.7.6",
+    "nyc": "^18.0.0",
+    "ot-json1": "^1.0.2",
     "rich-text": "^4.1.0",
-    "sharedb-mingo-memory": "^1.0.0 || ^2.0.0 || ^3.0.0",
-    "sinon": "^9.2.4",
-    "sinon-chai": "^3.7.0"
+    "sharedb-mingo-memory": "^5.0.0",
+    "sinon": "^22.0.0",
+    "sinon-chai": "^4.0.1"
   },
   "scripts": {
-    "lint": "./node_modules/.bin/eslint --ignore-path .gitignore '**/*.js'",
+    "lint": "eslint .",
     "lint:fix": "npm run lint -- --fix",
     "test": "mocha",
     "test:mongodb3": "_SHAREDB_MONGODB_DRIVER=mongodb3 npm test",

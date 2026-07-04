@@ -79,11 +79,7 @@ describe('getOpsWithoutStrictLinking: true', function() {
 
       callInSeries([
         function(next) {
-          mongo.collection('o_' + collection).insertOne(spuriousOp)
-            .then(function(result) {
-              next(null, result);
-            })
-            .catch(next);
+          insertSpuriousOps(db, collection, [spuriousOp], next);
         },
         function(result, next) {
           db.getOps(collection, id, 0, 2, null, next);
@@ -104,11 +100,7 @@ describe('getOpsWithoutStrictLinking: true', function() {
 
       callInSeries([
         function(next) {
-          mongo.collection('o_' + collection).insertOne(spuriousOp)
-            .then(function(result) {
-              next(null, result);
-            })
-            .catch(next);
+          insertSpuriousOps(db, collection, [spuriousOp], next);
         },
         function(result, next) {
           db.getOps(collection, id, 0, 2, null, next);
@@ -134,11 +126,7 @@ describe('getOpsWithoutStrictLinking: true', function() {
 
       callInSeries([
         function(next) {
-          mongo.collection('o_' + collection).insertMany(spuriousOps)
-            .then(function(result) {
-              next(null, result);
-            })
-            .catch(next);
+          insertSpuriousOps(db, collection, spuriousOps, next);
         },
         function(result, next) {
           db.getOps(collection, id, 0, 2, null, next);
@@ -173,11 +161,42 @@ function commitOpChain(db, mongo, collection, id, ops, previousOpId, version, ca
   var snapshot = {id: id, v: version + 1, type: 'json0', data: {}, m: null, _opLink: previousOpId};
   db.commit(collection, id, op, snapshot, null, function(error) {
     if (error) return callback(error);
-    mongo.collection('o_' + collection).find({d: id, v: version}).next()
-      .then(function(op) {
-        commitOpChain(db, mongo, collection, id, ops, op._id, ++version, callback);
-      })
-      .catch(callback);
+    getCommittedOp(db, collection, id, version, function(error, op) {
+      if (error) return callback(error);
+      commitOpChain(db, mongo, collection, id, ops, (op ? op._id : null), ++version, callback);
+    });
+  });
+}
+
+function insertSpuriousOps(db, collection, ops, callback) {
+  db.getOpCollection(collection, function(error, opCollection) {
+    if (error) return callback(error);
+    opCollection.insertMany(ops).then(function(result) {
+      callback(null, result);
+    }, callback);
+  });
+}
+
+function getCommittedOp(db, collection, id, version, callback) {
+  db.getOpCollections(collection, function(error, opCollections) {
+    if (error) return callback(error);
+
+    var pending = opCollections.length;
+    for (var i = 0; i < opCollections.length; i++) {
+      opCollections[i].find({d: id, v: version}).next().then(function(op) {
+        if (!pending) return;
+        if (op) {
+          pending = 0;
+          return callback(null, op);
+        }
+        pending--;
+        if (!pending) callback(null, null);
+      }, function(error) {
+        if (!pending) return;
+        pending = 0;
+        callback(error);
+      });
+    }
   });
 }
 
